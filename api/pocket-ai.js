@@ -1,216 +1,239 @@
-// api/pocket-ai.js
-// Vercel Node.js Runtime 用のシンプルなハンドラ :contentReference[oaicite:3]{index=3}
-
-export const config = {
-  api: {
-    bodyParser: {
-      sizeLimit: '1mb', // 10秒くらいのPCMなら十分
-    },
-  },
-};
-
-export default async function handler(req, res) {
-  try {
-    if (req.method !== 'POST') {
-      res.status(405).json({ error: 'Use POST' });
-      return;
-    }
-
-    const { audioBase64 } = req.body || {};
-    if (!audioBase64) {
-      res.status(400).json({ error: 'audioBase64 is required' });
-      return;
-    }
-
-    // 1. Base64 -> PCM16バッファ
-    const pcmBuffer = Buffer.from(audioBase64, 'base64');
-
-    // 2. PCM16 -> WAV 16kHz mono
-    const wavBuffer = pcm16ToWav(pcmBuffer, 16000);
-
-    // 3. Azure Speech で STT
-    const text = await speechToText(wavBuffer);
-
-    // デバッグ用：何と言ったかをそのまま返すだけでもOK
-    // return res.status(200).json({ text });
-
-    // 4. Azure OpenAI で返答生成
-    const reply = await callChatGPT(text || '（聞き取れませんでした）');
-
-    // 5. Azure Speech で TTS
-    const audioBuffer = await textToSpeech(reply);
-
-    // 6. MP3 を返す
-    res.setHeader('Content-Type', 'audio/mpeg');
-    res.send(audioBuffer);
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: 'internal error', detail: String(err) });
-  }
-}
+// Vercel Serverless Function
+// AtomS3R から送られてきた Base64 PCM(16kHz/16bit/mono) を
+// 1. WAV に変換して Azure Speech STT へ送信
+// 2. 得られたテキストを Azure OpenAI Chat Completions に投げる
+// 3. 返答テキストを Azure Speech TTS に渡して MP3 を生成
+// 4. MP3 バイナリをそのままレスポンスとして返す
 
 /**
- * 16bit PCM モノラル -> WAV (RIFF) 変換
+ * PCM16 (16kHz, mono) Buffer から WAV Buffer を生成
+ * @param {Buffer} pcmBuffer
+ * @param {Object} options
+ * @param {number} options.sampleRate
+ * @param {number} options.numChannels
+ * @returns {Buffer}
  */
-function pcm16ToWav(pcmBuffer, sampleRate) {
-  const numChannels = 1;
+function pcm16ToWavBuffer(pcmBuffer, { sampleRate = 16000, numChannels = 1 } = {}) {
   const bitsPerSample = 16;
   const byteRate = (sampleRate * numChannels * bitsPerSample) / 8;
   const blockAlign = (numChannels * bitsPerSample) / 8;
+  const wavHeaderSize = 44;
   const dataSize = pcmBuffer.length;
 
-  const buffer = Buffer.alloc(44 + dataSize);
+  const buffer = Buffer.alloc(wavHeaderSize + dataSize);
 
-  let offset = 0;
-  buffer.write('RIFF', offset); offset += 4;
-  buffer.writeUInt32LE(36 + dataSize, offset); offset += 4;
-  buffer.write('WAVE', offset); offset += 4;
+  // RIFF ヘッダ
+  buffer.write('RIFF', 0); // ChunkID
+  buffer.writeUInt32LE(36 + dataSize, 4); // ChunkSize = 36 + Subchunk2Size
+  buffer.write('WAVE', 8); // Format
 
-  // fmt chunk
-  buffer.write('fmt ', offset); offset += 4;
-  buffer.writeUInt32LE(16, offset); offset += 4;          // Subchunk1Size
-  buffer.writeUInt16LE(1, offset); offset += 2;           // AudioFormat (PCM)
-  buffer.writeUInt16LE(numChannels, offset); offset += 2; // NumChannels
-  buffer.writeUInt32LE(sampleRate, offset); offset += 4;  // SampleRate
-  buffer.writeUInt32LE(byteRate, offset); offset += 4;    // ByteRate
-  buffer.writeUInt16LE(blockAlign, offset); offset += 2;  // BlockAlign
-  buffer.writeUInt16LE(bitsPerSample, offset); offset += 2; // BitsPerSample
+  // fmt チャンク
+  buffer.write('fmt ', 12); // Subchunk1ID
+  buffer.writeUInt32LE(16, 16); // Subchunk1Size (16 for PCM)
+  buffer.writeUInt16LE(1, 20); // AudioFormat (1 = PCM)
+  buffer.writeUInt16LE(numChannels, 22); // NumChannels
+  buffer.writeUInt32LE(sampleRate, 24); // SampleRate
+  buffer.writeUInt32LE(byteRate, 28); // ByteRate
+  buffer.writeUInt16LE(blockAlign, 32); // BlockAlign
+  buffer.writeUInt16LE(bitsPerSample, 34); // BitsPerSample
 
-  // data chunk
-  buffer.write('data', offset); offset += 4;
-  buffer.writeUInt32LE(dataSize, offset); offset += 4;
+  // data チャンク
+  buffer.write('data', 36); // Subchunk2ID
+  buffer.writeUInt32LE(dataSize, 40); // Subchunk2Size
 
-  pcmBuffer.copy(buffer, offset);
+  // PCM データ本体
+  pcmBuffer.copy(buffer, wavHeaderSize);
 
   return buffer;
 }
 
-/**
- * Speech STT (短い音声用 REST) :contentReference[oaicite:4]{index=4}
- */
-async function speechToText(wavBuffer) {
-  const token = await getSpeechToken();
-  const region = process.env.AZURE_SPEECH_REGION;
+function escapeForXml(text) {
+  if (!text) return '';
+  return text
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&apos;');
+}
 
-  const url =
-    `https://${region}.stt.speech.microsoft.com/speech/recognition/conversation/cognitiveservices/v1` +
-    `?language=ja-JP`;
+async function callAzureSpeechToText(wavBuffer) {
+  const speechKey = process.env.AZURE_SPEECH_KEY;
+  const speechRegion = process.env.AZURE_SPEECH_REGION;
 
-  const resp = await fetch(url, {
+  if (!speechKey || !speechRegion) {
+    throw new Error('AZURE_SPEECH_KEY / AZURE_SPEECH_REGION が設定されていません。');
+  }
+
+  const url = `https://${speechRegion}.stt.speech.microsoft.com/speech/recognition/conversation/cognitiveservices/v1?language=ja-JP`;
+
+  const res = await fetch(url, {
     method: 'POST',
     headers: {
-      Authorization: `Bearer ${token}`,
+      'Ocp-Apim-Subscription-Key': speechKey,
       'Content-Type': 'audio/wav; codecs=audio/pcm; samplerate=16000',
-      Accept: 'application/json',
+      'Accept': 'application/json'
     },
     body: wavBuffer
   });
 
-  if (!resp.ok) {
-    throw new Error(`STT failed: ${resp.status} ${await resp.text()}`);
+  if (!res.ok) {
+    const text = await res.text().catch(() => '');
+    throw new Error(`Azure Speech STT でエラーが発生しました: ${res.status} ${res.statusText} ${text}`);
   }
 
-  const json = await resp.json();
-  return json.DisplayText || '';
+  const data = await res.json();
+  // REST API は RecognitionStatus / DisplayText などを返す
+  const recognizedText = data.DisplayText || data.Text || '';
+
+  if (!recognizedText) {
+    throw new Error('音声認識結果が空でした。');
+  }
+
+  return recognizedText;
 }
 
-async function getSpeechToken() {
-  const region = process.env.AZURE_SPEECH_REGION;
-  const key = process.env.AZURE_SPEECH_KEY;
+async function callAzureOpenAIChat(promptText) {
+  const openaiKey = process.env.AZURE_OPENAI_KEY;
+  const openaiEndpoint = process.env.AZURE_OPENAI_ENDPOINT;
+  const openaiDeployment = process.env.AZURE_OPENAI_DEPLOYMENT;
+  const apiVersion = process.env.AZURE_OPENAI_API_VERSION || '2024-02-15-preview';
 
-  const resp = await fetch(
-    `https://${region}.api.cognitive.microsoft.com/sts/v1.0/issueToken`,
-    {
-      method: 'POST',
-      headers: {
-        'Ocp-Apim-Subscription-Key': key,
-        'Content-Type': 'application/x-www-form-urlencoded',
-        'Content-Length': '0',
+  if (!openaiKey || !openaiEndpoint || !openaiDeployment) {
+    throw new Error('AZURE_OPENAI_KEY / AZURE_OPENAI_ENDPOINT / AZURE_OPENAI_DEPLOYMENT が設定されていません。');
+  }
+
+  const endpoint = openaiEndpoint.replace(/\/$/, '');
+  const url = `${endpoint}/openai/deployments/${openaiDeployment}/chat/completions?api-version=${apiVersion}`;
+
+  const body = {
+    messages: [
+      {
+        role: 'system',
+        content: 'あなたは親切な日本語の会話アシスタントです。できるだけ簡潔に、わかりやすく答えてください。'
       },
-    }
-  );
+      {
+        role: 'user',
+        content: promptText
+      }
+    ],
+    max_tokens: 256,
+    temperature: 0.7
+  };
 
-  if (!resp.ok) {
-    throw new Error(`getSpeechToken failed: ${resp.status} ${await resp.text()}`);
-  }
-  return resp.text();
-}
-
-/**
- * Azure OpenAI Chat Completions :contentReference[oaicite:5]{index=5}
- */
-async function callChatGPT(userText) {
-  const endpoint = process.env.AZURE_OPENAI_ENDPOINT;
-  const deployment = process.env.AZURE_OPENAI_DEPLOYMENT;
-  const apiKey = process.env.AZURE_OPENAI_KEY;
-  const apiVersion = '2024-02-15-preview';
-
-  const url = `${endpoint}/openai/deployments/${deployment}/chat/completions?api-version=${apiVersion}`;
-
-  const resp = await fetch(url, {
+  const res = await fetch(url, {
     method: 'POST',
     headers: {
-      'api-key': apiKey,
-      'Content-Type': 'application/json',
+      'api-key': openaiKey,
+      'Content-Type': 'application/json'
     },
-    body: JSON.stringify({
-      messages: [
-        {
-          role: 'system',
-          content: 'あなたは小さなポケットAIアシスタントです。短く、カジュアルに日本語で答えてください。',
-        },
-        { role: 'user', content: userText },
-      ],
-      max_tokens: 256,
-    }),
+    body: JSON.stringify(body)
   });
 
-  if (!resp.ok) {
-    throw new Error(`OpenAI failed: ${resp.status} ${await resp.text()}`);
+  if (!res.ok) {
+    const text = await res.text().catch(() => '');
+    throw new Error(`Azure OpenAI Chat でエラーが発生しました: ${res.status} ${res.statusText} ${text}`);
   }
-  const json = await resp.json();
-  return json.choices?.[0]?.message?.content?.trim() ?? '';
+
+  const data = await res.json();
+  const replyText =
+    data.choices?.[0]?.message?.content?.trim() ||
+    data.choices?.[0]?.messages?.[0]?.content?.trim() ||
+    '';
+
+  if (!replyText) {
+    throw new Error('Azure OpenAI からの返答が取得できませんでした。');
+  }
+
+  return replyText;
 }
 
-/**
- * Azure Text-to-Speech (REST) :contentReference[oaicite:6]{index=6}
- */
-async function textToSpeech(text) {
-  const token = await getSpeechToken();
-  const region = process.env.AZURE_SPEECH_REGION;
+async function callAzureSpeechTTS(text) {
+  const speechKey = process.env.AZURE_SPEECH_KEY;
+  const speechRegion = process.env.AZURE_SPEECH_REGION;
 
-  const url = `https://${region}.tts.speech.microsoft.com/cognitiveservices/v1`;
+  if (!speechKey || !speechRegion) {
+    throw new Error('AZURE_SPEECH_KEY / AZURE_SPEECH_REGION が設定されていません。');
+  }
 
-  // 日本語女性のサンプル: "ja-JP-NanamiNeural" など、ポータルで確認して好きなのに変えてOK
+  const url = `https://${speechRegion}.tts.speech.microsoft.com/cognitiveservices/v1`;
+
+  // 日本語の女性音声例: ja-JP-NanamiNeural
   const ssml = `
-    <speak version="1.0" xml:lang="ja-JP">
-      <voice xml:lang="ja-JP" name="ja-JP-NanamiNeural">
-        ${escapeXml(text)}
-      </voice>
-    </speak>`.trim();
+<speak version="1.0" xml:lang="ja-JP">
+  <voice xml:lang="ja-JP" xml:gender="Female" name="ja-JP-NanamiNeural">
+    ${escapeForXml(text)}
+  </voice>
+</speak>`;
 
-  const resp = await fetch(url, {
+  const res = await fetch(url, {
     method: 'POST',
     headers: {
-      Authorization: `Bearer ${token}`,
+      'Ocp-Apim-Subscription-Key': speechKey,
       'Content-Type': 'application/ssml+xml',
-      'X-Microsoft-OutputFormat': 'audio-16khz-32kbitrate-mono-mp3',
-      'User-Agent': 'pocket-ai-assistant',
+      'X-Microsoft-OutputFormat': 'audio-16khz-128kbitrate-mono-mp3',
+      'User-Agent': 'pocket-ai-vercel'
     },
-    body: ssml,
+    body: ssml
   });
 
-  if (!resp.ok) {
-    throw new Error(`TTS failed: ${resp.status} ${await resp.text()}`);
+  if (!res.ok) {
+    const text = await res.text().catch(() => '');
+    throw new Error(`Azure Speech TTS でエラーが発生しました: ${res.status} ${res.statusText} ${text}`);
   }
 
-  const arrayBuffer = await resp.arrayBuffer();
+  const arrayBuffer = await res.arrayBuffer();
   return Buffer.from(arrayBuffer);
 }
 
-function escapeXml(str) {
-  return str
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;');
-}
+module.exports = async (req, res) => {
+  if (req.method !== 'POST') {
+    res.status(405).json({ error: 'Method Not Allowed. Use POST.' });
+    return;
+  }
+
+  try {
+    const body = typeof req.body === 'string' ? JSON.parse(req.body || '{}') : (req.body || {});
+
+    // AtomS3R 側の JSON 仕様:
+    // { "audioBase64": "<PCM 16kHz/16bit/mono の Base64 文字列>" }
+    const base64 = body.audioBase64 || body.audio || '';
+    if (!base64 || typeof base64 !== 'string') {
+      res.status(400).json({ error: 'audioBase64 (Base64 PCM) が指定されていません。' });
+      return;
+    }
+
+    // Base64 → PCM Buffer
+    const pcmBuffer = Buffer.from(base64, 'base64');
+
+    // PCM → WAV
+    const wavBuffer = pcm16ToWavBuffer(pcmBuffer, { sampleRate: 16000, numChannels: 1 });
+
+    // Azure Speech STT でテキスト化
+    const recognizedText = await callAzureSpeechToText(wavBuffer);
+
+    // Azure OpenAI Chat で返答を生成
+    const replyText = await callAzureOpenAIChat(recognizedText);
+
+    // Azure Speech TTS で MP3 を生成
+    const mp3Buffer = await callAzureSpeechTTS(replyText);
+
+    // MP3 バイナリをそのまま返す
+    res.setHeader('Content-Type', 'audio/mpeg');
+    res.setHeader('Content-Length', mp3Buffer.length);
+
+    // 参考用にテキストもヘッダに付けておく（任意）
+    res.setHeader('X-Recognized-Text', encodeURIComponent(recognizedText).slice(0, 1024));
+    res.setHeader('X-Reply-Text', encodeURIComponent(replyText).slice(0, 1024));
+
+    res.status(200).send(mp3Buffer);
+  } catch (err) {
+    console.error('[pocket-ai] Error:', err);
+    res.status(500).json({
+      error: 'Internal Server Error',
+      message: process.env.NODE_ENV === 'production' ? undefined : String(err?.message || err)
+    });
+  }
+};
+
+

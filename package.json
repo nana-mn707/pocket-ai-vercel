@@ -1,0 +1,12 @@
+{
+  "name": "pocket-ai-vercel",
+  "version": "1.0.0",
+  "description": "AtomS3R からの PCM 音声を Azure Speech / Azure OpenAI / Speech TTS と連携して MP3 を返す Vercel Serverless API",
+  "main": "api/pocket-ai.js",
+  "scripts": {
+    "start": "node api/pocket-ai.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "MIT"
+}

@@ -84,10 +84,11 @@ async function callAzureSpeechToText(wavBuffer) {
 
   const data = await res.json();
   // REST API は RecognitionStatus / DisplayText などを返す
-  const recognizedText = data.DisplayText || data.Text || '';
+  let recognizedText = data.DisplayText || data.Text || '';
 
   if (!recognizedText) {
-    throw new Error('音声認識結果が空でした。');
+    // throw new Error('音声認識結果が空でした。');
+    recognizedText = 'エラーが発生しました。';
   }
 
   return recognizedText;

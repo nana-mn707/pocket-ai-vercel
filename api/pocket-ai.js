@@ -2,8 +2,8 @@
 // AtomS3R から送られてきた Base64 PCM(16kHz/16bit/mono) を
 // 1. WAV に変換して Azure Speech STT へ送信
 // 2. 得られたテキストを Azure OpenAI Chat Completions に投げる
-// 3. 返答テキストを Azure Speech TTS に渡して MP3 を生成
-// 4. MP3 バイナリをそのままレスポンスとして返す
+// 3. 返答テキストを Azure Speech TTS に渡して WAV(PCM) を生成
+// 4. WAV バイナリをそのままレスポンスとして返す
 
 /**
  * PCM16 (16kHz, mono) Buffer から WAV Buffer を生成
@@ -172,7 +172,9 @@ async function callAzureSpeechTTS(text) {
     headers: {
       'Ocp-Apim-Subscription-Key': speechKey,
       'Content-Type': 'application/ssml+xml',
-      'X-Microsoft-OutputFormat': 'audio-16khz-128kbitrate-mono-mp3',
+      // WAV (RIFF) 形式で 16kHz/16bit/mono の PCM を取得
+      // → デバイス側では先頭 44 バイトのヘッダをスキップして生 PCM として再生できる
+      'X-Microsoft-OutputFormat': 'riff-16khz-16bit-mono-pcm',
       'User-Agent': 'pocket-ai-vercel'
     },
     body: ssml
@@ -207,27 +209,27 @@ module.exports = async (req, res) => {
     // Base64 → PCM Buffer
     const pcmBuffer = Buffer.from(base64, 'base64');
 
-    // PCM → WAV
-    const wavBuffer = pcm16ToWavBuffer(pcmBuffer, { sampleRate: 16000, numChannels: 1 });
+    // PCM → WAV（STT 用）
+    const sttWavBuffer = pcm16ToWavBuffer(pcmBuffer, { sampleRate: 16000, numChannels: 1 });
 
     // Azure Speech STT でテキスト化
-    const recognizedText = await callAzureSpeechToText(wavBuffer);
+    const recognizedText = await callAzureSpeechToText(sttWavBuffer);
 
     // Azure OpenAI Chat で返答を生成
     const replyText = await callAzureOpenAIChat(recognizedText);
 
-    // Azure Speech TTS で MP3 を生成
-    const mp3Buffer = await callAzureSpeechTTS(replyText);
+    // Azure Speech TTS で WAV(PCM) を生成
+    const ttsWavBuffer = await callAzureSpeechTTS(replyText);
 
-    // MP3 バイナリをそのまま返す
-    res.setHeader('Content-Type', 'audio/mpeg');
-    res.setHeader('Content-Length', mp3Buffer.length);
+    // WAV バイナリをそのまま返す
+    res.setHeader('Content-Type', 'audio/wav');
+    res.setHeader('Content-Length', ttsWavBuffer.length);
 
     // 参考用にテキストもヘッダに付けておく（任意）
     res.setHeader('X-Recognized-Text', encodeURIComponent(recognizedText).slice(0, 1024));
     res.setHeader('X-Reply-Text', encodeURIComponent(replyText).slice(0, 1024));
 
-    res.status(200).send(mp3Buffer);
+    res.status(200).send(ttsWavBuffer);
   } catch (err) {
     console.error('[pocket-ai] Error:', err);
     res.status(500).json({

@@ -270,6 +270,51 @@ async function postTodoToNotion({ title, when, notes, sourceText, sessionId }) {
   }
 }
 
+// セッションごとに PCM チャンクを蓄積する簡易バッファ（同一コンテナ内でのみ有効）
+// 1秒 = 16000 * 2 bytes
+const BYTES_PER_SECOND = 16000 * 2;
+const MIN_UTTER_SECONDS = 3;               // 少なくとも3秒分たまったらSTTにかける
+const MIN_UTTER_BYTES   = BYTES_PER_SECOND * MIN_UTTER_SECONDS;
+
+const sessionBuffers = (globalThis.__speechTodoSessions =
+  globalThis.__speechTodoSessions || new Map());
+
+async function processPcmUtterance(pcmBuffer, sessionId) {
+  // PCM → WAV
+  const wavBuffer = pcm16ToWavBuffer(pcmBuffer, { sampleRate: 16000, numChannels: 1 });
+
+  // Azure Speech STT でテキスト化
+  const recognizedText = await callAzureSpeechToText(wavBuffer);
+
+  let todo = {
+    is_todo: false,
+    title: null,
+    when: null,
+    notes: null
+  };
+  let notionPosted = false;
+
+  if (recognizedText) {
+    todo = await callAzureOpenAITodoAnalyzer(recognizedText);
+
+    if (todo.is_todo) {
+      notionPosted = await postTodoToNotion({
+        title: todo.title,
+        when: todo.when,
+        notes: todo.notes,
+        sourceText: recognizedText,
+        sessionId
+      });
+    }
+  }
+
+  return {
+    recognizedText,
+    todo,
+    notionPosted
+  };
+}
+
 module.exports = async (req, res) => {
   if (req.method !== 'POST') {
     res.status(405).json({ error: 'Method Not Allowed. Use POST.' });
@@ -279,58 +324,67 @@ module.exports = async (req, res) => {
   try {
     const body = typeof req.body === 'string' ? JSON.parse(req.body || '{}') : (req.body || {});
 
-    const mode = body.mode || 'utterance';
-    if (mode !== 'utterance') {
-      res.status(400).json({ error: 'Unsupported mode', mode });
-      return;
-    }
-
+    const mode = body.mode || 'chunk';
     const base64 = body.audioBase64 || body.audio || '';
+    const sessionId = body.sessionId || 'default';
+
     if (!base64 || typeof base64 !== 'string') {
       res.status(400).json({ error: 'audioBase64 (Base64 PCM) が指定されていません。' });
       return;
     }
 
-    const sessionId = body.sessionId || null;
+    // Base64 → PCM Buffer（1秒チャンク）
+    const pcmChunk = Buffer.from(base64, 'base64');
 
-    // Base64 → PCM Buffer
-    const pcmBuffer = Buffer.from(base64, 'base64');
+    if (mode === 'chunk') {
+      const prev = sessionBuffers.get(sessionId) || Buffer.alloc(0);
+      const combined = Buffer.concat([prev, pcmChunk]);
 
-    // PCM → WAV
-    const wavBuffer = pcm16ToWavBuffer(pcmBuffer, { sampleRate: 16000, numChannels: 1 });
-
-    // Azure Speech STT でテキスト化
-    const recognizedText = await callAzureSpeechToText(wavBuffer);
-
-    let todo = {
-      is_todo: false,
-      title: null,
-      when: null,
-      notes: null
-    };
-    let notionPosted = false;
-
-    if (recognizedText) {
-      todo = await callAzureOpenAITodoAnalyzer(recognizedText);
-
-      if (todo.is_todo) {
-        notionPosted = await postTodoToNotion({
-          title: todo.title,
-          when: todo.when,
-          notes: todo.notes,
-          sourceText: recognizedText,
-          sessionId
+      if (combined.length < MIN_UTTER_BYTES) {
+        // まだ3秒未満なのでバッファに貯めるだけ
+        sessionBuffers.set(sessionId, combined);
+        res.status(200).json({
+          recognizedText: '',
+          todoTitle: null,
+          todoWhen: null,
+          todoNotes: null,
+          notionPosted: false,
+          pending: true
         });
+        return;
       }
+
+      // 3秒ぶん取り出して処理し、残りは次回以降に回す
+      const toProcess = combined.subarray(0, MIN_UTTER_BYTES);
+      const remaining = combined.subarray(MIN_UTTER_BYTES);
+      sessionBuffers.set(sessionId, remaining);
+
+      const { recognizedText, todo, notionPosted } = await processPcmUtterance(toProcess, sessionId);
+
+      res.status(200).json({
+        recognizedText,
+        todoTitle: todo.title,
+        todoWhen: todo.when,
+        todoNotes: todo.notes,
+        notionPosted
+      });
+      return;
     }
 
-    res.status(200).json({
-      recognizedText,
-      todoTitle: todo.title,
-      todoWhen: todo.when,
-      todoNotes: todo.notes,
-      notionPosted
-    });
+    // 後方互換用: mode === 'utterance' の場合は単発で処理
+    if (mode === 'utterance') {
+      const { recognizedText, todo, notionPosted } = await processPcmUtterance(pcmChunk, sessionId);
+      res.status(200).json({
+        recognizedText,
+        todoTitle: todo.title,
+        todoWhen: todo.when,
+        todoNotes: todo.notes,
+        notionPosted
+      });
+      return;
+    }
+
+    res.status(400).json({ error: 'Unsupported mode', mode });
   } catch (err) {
     console.error('[todo-from-speech] Error:', err);
     res.status(500).json({
